@@ -1145,6 +1145,102 @@ class Table:
                     if K in self.md.micro:
                         self.qK[self.md.micro[K][0]][inb, iyq, it] = q
 
+    def read_from_stellarcollapse(
+        self,
+        path,
+        mb: float | None = None,
+    ):
+        """
+        This function reads the EOS from the stellarcollapse.org hdf5 files and
+        initializes a pycompose Table object. stellarcollapse.org tables use
+        a "custom" mass factor while CompOSE uses the neutron mass as default.
+        The specific internal energy and the chemical potentials are rescaled
+        such that they are compatible to the neutron mass.
+        """
+        with h5py.File(path, 'r') as hf:
+            sc = {key: np.array(hf[key][()]) for key in hf
+                     if isinstance(hf[key], h5py.Dataset) and hf[key].dtype.kind != 'V'}
+
+        for key, ar in sc.items():
+            if not len(ar.shape) == 3:
+                continue
+            sc[key] = np.transpose(ar, (2, 0, 1))
+
+
+        #mb = sc['mass_factor']
+
+        shift = sc['energy_shift']
+
+        if mb is None:
+            UAMU_MEV      = 931.494061
+            mb = UAMU_MEV*(1.0 - shift/Table.unit_eps)
+
+        self.mn = 939.56535
+        self.mp = 938.27209
+        self.nb = 10**sc['logrho'] / Table.unit_dens/mb
+        self.t = 10**sc['logtemp']
+        self.yq = sc['ye']
+
+        self.shape = (self.nb.shape[0], self.yq.shape[0], self.t.shape[0])
+        self.valid = np.ones(self.shape, dtype=bool)
+        self.lepton = True
+
+        self.thermo["Q1"] = 10**sc['logpress'] / Table.unit_press / self.nb[:, None, None]
+        self.thermo["Q2"] = sc['entropy']
+        mu_e = sc["mu_e"]
+        mu_p = sc["mu_p"]
+        mu_n = sc["mu_n"]
+        eps = 10**sc['logenergy'] / Table.unit_eps
+        eps -= shift / Table.unit_eps
+        # transform to new mass factor
+        eps = (1+eps)*mb/self.mn - 1
+        self.thermo["Q7"] = eps
+        temp_entr = self.t[None,  None, :]*self.thermo["Q2"]
+        self.thermo["Q6"] = eps - temp_entr/self.mn
+
+        self.thermo["Q3"] = (mu_n + mb)/self.mn - 1
+        self.thermo["Q4"] = (mu_p - mu_n)/self.mn
+        self.thermo["Q5"] = (mu_e + mu_p - mu_n)/self.mn
+
+        self.Y["e"] = np.meshgrid(self.nb, self.yq, self.t, indexing='ij')[1]
+        self.Y["n"] = sc['Xn']
+        self.Y["p"] = sc['Xp']
+        self.Y["He4"] = sc['Xa']/4
+
+        if "Xl" in sc.keys():
+            if "Xl" not in self.md.quads.values():
+                Yl = sc["Xl"]/sc["Albar"]
+                Yh = sc["Xh"]/sc["Abar"]
+                Xh = sc["Xh"]+sc["Xl"]
+                Yh[mask := Xh <= 0] = 1
+                Yl[mask] = 1
+                Abar = Xh/(Yh+Yl)
+                Abar[mask] = 1
+                Zbar = (Yh*sc["Zbar"] + Yl*sc["Zlbar"])/(Yh+Yl)
+                self.Y["N"] = Xh/Abar
+                self.Y["N"][~np.isfinite(self.Y["N"])] = 0
+                self.A["N"] = Abar
+                self.Z["N"] = Zbar
+            else:
+                self.Y["N"] = sc["X"]/sc["Abar"]
+                self.Y["N"][~np.isfinite(self.Y["N"])] = 0
+                self.A["N"] = sc["Abar"]
+                self.Z["N"] = sc["Zbar"]
+                self.Y["Nl"] = sc["Xl"]/sc["Albar"]
+                self.Y["Nl"][~np.isfinite(self.Y["Nl"])] = 0
+                self.A["Nl"] = sc["Albar"]
+                self.Z["Nl"] = sc["Zlbar"]
+        else:
+            self.Y["N"] = sc["Xh"]/sc["Abar"]
+            self.Y["N"][~np.isfinite(self.Y["N"])] = 0
+            self.A["N"] = sc["Abar"]
+            self.Z["N"] = sc["Zbar"]
+
+        for name, _ in self.md.pairs.values():
+            if name not in self.Y:
+                self.Y[name] = np.zeros_like(self.Y['e'])
+
+
     def read_from_pizza(
         self,
         hydro_path,
