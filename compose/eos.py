@@ -1583,9 +1583,11 @@ class Table:
                 p = Table.unit_press * self.thermo["Q1"][i, 0, 0] * self.nb[i]
                 f.write("%d %.15e %.15e %.15e\n" % (ind + 1, nb, e, p))
 
-    def write_rns(self, fname):
+    def write_rns(self, fname, truncate=True):
         """
         Export the table in RNS format. This is only possible for 1D tables.
+        If truncate is True, the lowest pressure is enforced to be 0 by subtracting p[0] from all p.
+        This is necessary for use with RNSC (for some reason).
         """
         assert self.shape[1] == 1
         assert self.shape[2] == 1
@@ -1594,17 +1596,20 @@ class Table:
         sed = self.thermo["Q7"][icut:, 0, 0]
         nb = self.nb[icut:]
         p = self.thermo["Q1"][icut:, 0, 0] * nb
-        p -= p[0]
+        if truncate:
+            p -= p[0]
+
         ed = (1 + sed) * self.mn * nb
-        h = sint.cumulative_trapezoid(1.0 / (ed + p), p)
+        h = sint.cumulative_trapezoid(1.0 / (ed + p), p, initial=0)
 
         nb_CGS = 1e39 * nb
         tmd_CGS = Table.unit_dens * ed
         p_CGS = Table.unit_press * p
         h_CGS = Table.unit_eps * h
 
-        h_CGS[0] = 1  # Exact value = 0, but RNS seems to require that.
-        p_CGS[0] = 1
+        if truncate:
+             h_CGS[0] = 1 # Exact value = 0, but RNS seems to require that.
+             p_CGS[0] = 1
 
         with open(fname, "w") as f:
             f.write(f"{len(tmd_CGS):d} \n")
