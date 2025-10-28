@@ -856,7 +856,7 @@ class Table:
             iy1 = None
 
         if t_min is not None:
-            assert t_min < self.t[-1]
+            assert t_min < self.t[-1], f"t_min < min of table {t_min}<{self.t[-1]}"
             it0 = self.t.searchsorted(t_min)
         else:
             it0 = None
@@ -1145,6 +1145,102 @@ class Table:
                     if K in self.md.micro:
                         self.qK[self.md.micro[K][0]][inb, iyq, it] = q
 
+    def read_from_stellarcollapse(
+        self,
+        path,
+        mb: float | None = None,
+    ):
+        """
+        This function reads the EOS from the stellarcollapse.org hdf5 files and
+        initializes a pycompose Table object. stellarcollapse.org tables use
+        a "custom" mass factor while CompOSE uses the neutron mass as default.
+        The specific internal energy and the chemical potentials are rescaled
+        such that they are compatible to the neutron mass.
+        """
+        with h5py.File(path, 'r') as hf:
+            sc = {key: np.array(hf[key][()]) for key in hf
+                     if isinstance(hf[key], h5py.Dataset) and hf[key].dtype.kind != 'V'}
+
+        for key, ar in sc.items():
+            if not len(ar.shape) == 3:
+                continue
+            sc[key] = np.transpose(ar, (2, 0, 1))
+
+
+        #mb = sc['mass_factor']
+
+        shift = sc['energy_shift']
+
+        if mb is None:
+            UAMU_MEV      = 931.494061
+            mb = UAMU_MEV*(1.0 - shift/Table.unit_eps)
+
+        self.mn = 939.56535
+        self.mp = 938.27209
+        self.nb = 10**sc['logrho'] / Table.unit_dens/mb
+        self.t = 10**sc['logtemp']
+        self.yq = sc['ye']
+
+        self.shape = (self.nb.shape[0], self.yq.shape[0], self.t.shape[0])
+        self.valid = np.ones(self.shape, dtype=bool)
+        self.lepton = True
+
+        self.thermo["Q1"] = 10**sc['logpress'] / Table.unit_press / self.nb[:, None, None]
+        self.thermo["Q2"] = sc['entropy']
+        mu_e = sc["mu_e"]
+        mu_p = sc["mu_p"]
+        mu_n = sc["mu_n"]
+        eps = 10**sc['logenergy'] / Table.unit_eps
+        eps -= shift / Table.unit_eps
+        # transform to new mass factor
+        eps = (1+eps)*mb/self.mn - 1
+        self.thermo["Q7"] = eps
+        temp_entr = self.t[None,  None, :]*self.thermo["Q2"]
+        self.thermo["Q6"] = eps - temp_entr/self.mn
+
+        self.thermo["Q3"] = (mu_n + mb)/self.mn - 1
+        self.thermo["Q4"] = (mu_p - mu_n)/self.mn
+        self.thermo["Q5"] = (mu_e + mu_p - mu_n)/self.mn
+
+        self.Y["e"] = np.meshgrid(self.nb, self.yq, self.t, indexing='ij')[1]
+        self.Y["n"] = sc['Xn']
+        self.Y["p"] = sc['Xp']
+        self.Y["He4"] = sc['Xa']/4
+
+        if "Xl" in sc.keys():
+            if "Xl" not in self.md.quads.values():
+                Yl = sc["Xl"]/sc["Albar"]
+                Yh = sc["Xh"]/sc["Abar"]
+                Xh = sc["Xh"]+sc["Xl"]
+                Yh[mask := Xh <= 0] = 1
+                Yl[mask] = 1
+                Abar = Xh/(Yh+Yl)
+                Abar[mask] = 1
+                Zbar = (Yh*sc["Zbar"] + Yl*sc["Zlbar"])/(Yh+Yl)
+                self.Y["N"] = Xh/Abar
+                self.Y["N"][~np.isfinite(self.Y["N"])] = 0
+                self.A["N"] = Abar
+                self.Z["N"] = Zbar
+            else:
+                self.Y["N"] = sc["X"]/sc["Abar"]
+                self.Y["N"][~np.isfinite(self.Y["N"])] = 0
+                self.A["N"] = sc["Abar"]
+                self.Z["N"] = sc["Zbar"]
+                self.Y["Nl"] = sc["Xl"]/sc["Albar"]
+                self.Y["Nl"][~np.isfinite(self.Y["Nl"])] = 0
+                self.A["Nl"] = sc["Albar"]
+                self.Z["Nl"] = sc["Zlbar"]
+        else:
+            self.Y["N"] = sc["Xh"]/sc["Abar"]
+            self.Y["N"][~np.isfinite(self.Y["N"])] = 0
+            self.A["N"] = sc["Abar"]
+            self.Z["N"] = sc["Zbar"]
+
+        for name, _ in self.md.pairs.values():
+            if name not in self.Y:
+                self.Y[name] = np.zeros_like(self.Y['e'])
+
+
     def read_from_pizza(
         self,
         hydro_path,
@@ -1158,12 +1254,12 @@ class Table:
         internal energy and the chemical potentials are rescaled such that they
         are compatible to the neutron mass.
         Empirically, it seems that the baryon mass was not rescaled in the pizza
-        tables. To correct this, use m_for_mb=931.4941 (atomic mass unit).
+        tables. To correct this, use m_for_mub=931.4941 (atomic mass unit).
         """
         with h5py.File(hydro_path, "r") as hf:
-            hydro = {key: np.array(hf[key][:]) for key in hf}
+            hydro = {key: np.array(hf[key][()]) for key in hf}
         with h5py.File(weak_path, "r") as hf:
-            weak = {key: np.array(hf[key][:]) for key in hf}
+            weak = {key: np.array(hf[key][()]) for key in hf}
 
         for key, ar in {**hydro, **weak}.items():
             if not len(ar.shape) == 3:
@@ -1210,6 +1306,7 @@ class Table:
         self.Y["He4"] = hydro["Xa"] / 4
         # "Abar" in Pizza seems to refer to the A of the representative nucleus
         self.Y["N"] = hydro["Xh"] / hydro["Abar"]
+        self.Y["N"][~np.isfinite(self.Y["N"])] = 0
         for name, _ in self.md.pairs.values():
             if name not in self.Y:
                 self.Y[name] = np.zeros_like(self.Y["e"])
@@ -1582,9 +1679,11 @@ class Table:
                 p = Table.unit_press * self.thermo["Q1"][i, 0, 0] * self.nb[i]
                 f.write("%d %.15e %.15e %.15e\n" % (ind + 1, nb, e, p))
 
-    def write_rns(self, fname):
+    def write_rns(self, fname, truncate=True):
         """
         Export the table in RNS format. This is only possible for 1D tables.
+        If truncate is True, the lowest pressure is enforced to be 0 by subtracting p[0] from all p.
+        This is necessary for use with RNSC (for some reason).
         """
         assert self.shape[1] == 1
         assert self.shape[2] == 1
@@ -1593,21 +1692,24 @@ class Table:
         sed = self.thermo["Q7"][icut:, 0, 0]
         nb = self.nb[icut:]
         p = self.thermo["Q1"][icut:, 0, 0] * nb
-        p -= p[0]
-        ed = (1 + sed) * self.mn * nb
-        h = sint.cumulative_trapezoid(1.0 / (ed + p), p)
+        if truncate:
+            p -= p[0]
 
-        nd_CGS = 1e39 * nb
+        ed = (1 + sed) * self.mn * nb
+        h = sint.cumulative_trapezoid(1.0 / (ed + p), p, initial=0)
+
+        nb_CGS = 1e39 * nb
         tmd_CGS = Table.unit_dens * ed
         p_CGS = Table.unit_press * p
         h_CGS = Table.unit_eps * h
 
-        h_CGS[0] = 1  # Exact value = 0, but RNS seems to require that.
-        p_CGS[0] = 1
+        if truncate:
+             h_CGS[0] = 1 # Exact value = 0, but RNS seems to require that.
+             p_CGS[0] = 1
 
         with open(fname, "w") as f:
             f.write(f"{len(tmd_CGS):d} \n")
-            for ed, p, h, n in zip(tmd_CGS, p_CGS, h_CGS, nd_CGS):
+            for ed, p, h, n in zip(tmd_CGS, p_CGS, h_CGS, nb_CGS):
                 f.write(f"{ed:.15e}  {p:.15e}  {h:.15e}  {n:.15e} \n")
 
     def write_txt(self, fname):
