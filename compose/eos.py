@@ -856,7 +856,7 @@ class Table:
             iy1 = None
 
         if t_min is not None:
-            assert t_min < self.t[-1]
+            assert t_min < self.t[-1], f"t_min < min of table {t_min}<{self.t[-1]}"
             it0 = self.t.searchsorted(t_min)
         else:
             it0 = None
@@ -1158,12 +1158,12 @@ class Table:
         internal energy and the chemical potentials are rescaled such that they
         are compatible to the neutron mass.
         Empirically, it seems that the baryon mass was not rescaled in the pizza
-        tables. To correct this, use m_for_mb=931.4941 (atomic mass unit).
+        tables. To correct this, use m_for_mub=931.4941 (atomic mass unit).
         """
         with h5py.File(hydro_path, "r") as hf:
-            hydro = {key: np.array(hf[key][:]) for key in hf}
+            hydro = {key: np.array(hf[key][()]) for key in hf}
         with h5py.File(weak_path, "r") as hf:
-            weak = {key: np.array(hf[key][:]) for key in hf}
+            weak = {key: np.array(hf[key][()]) for key in hf}
 
         for key, ar in {**hydro, **weak}.items():
             if not len(ar.shape) == 3:
@@ -1210,6 +1210,7 @@ class Table:
         self.Y["He4"] = hydro["Xa"] / 4
         # "Abar" in Pizza seems to refer to the A of the representative nucleus
         self.Y["N"] = hydro["Xh"] / hydro["Abar"]
+        self.Y["N"][~np.isfinite(self.Y["N"])] = 0
         for name, _ in self.md.pairs.values():
             if name not in self.Y:
                 self.Y[name] = np.zeros_like(self.Y["e"])
@@ -1597,7 +1598,7 @@ class Table:
         ed = (1 + sed) * self.mn * nb
         h = sint.cumulative_trapezoid(1.0 / (ed + p), p)
 
-        nd_CGS = 1e39 * nb
+        nb_CGS = 1e39 * nb
         tmd_CGS = Table.unit_dens * ed
         p_CGS = Table.unit_press * p
         h_CGS = Table.unit_eps * h
@@ -1607,7 +1608,7 @@ class Table:
 
         with open(fname, "w") as f:
             f.write(f"{len(tmd_CGS):d} \n")
-            for ed, p, h, n in zip(tmd_CGS, p_CGS, h_CGS, nd_CGS):
+            for ed, p, h, n in zip(tmd_CGS, p_CGS, h_CGS, nb_CGS):
                 f.write(f"{ed:.15e}  {p:.15e}  {h:.15e}  {n:.15e} \n")
 
     def write_txt(self, fname):
